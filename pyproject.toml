@@ -7,6 +7,7 @@ authors = [
     { name = "Karim3637", email = "karimtaha0303@gmail.com" }
 ]
 requires-python = ">=3.14"
+
 dependencies = [
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
@@ -14,6 +15,9 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "qdrant-client>=1.19.1",
     "uvicorn>=0.52.4",
+    "python-dotenv>=1.1.0",
+    "beautifulsoup4>=4.14.0",
+    "google-genai>=1.0.0",
 ]
 
 [project.scripts]
