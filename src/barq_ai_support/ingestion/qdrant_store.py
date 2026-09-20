@@ -14,16 +14,33 @@ from barq_ai_support.servicenow_client import ServiceNowClient
 load_dotenv()
 
 
-COLLECTION_NAME = "barq_kb_chunks"
+COLLECTION_NAME = os.environ.get(
+    "QDRANT_COLLECTION_NAME", "barq_kb_chunks"
+)
 
 # Number of points to save to Qdrant at a time
 BATCH_SIZE = 10
 
 
-client = QdrantClient(
-    url=os.environ["QDRANT_URL"],
-    api_key=os.environ["QDRANT_API_KEY"],
-)
+_client = None
+
+
+def get_client() -> QdrantClient:
+    """
+    Lazily create the Qdrant client on first use, so importing
+    this module doesn't require QDRANT_URL/QDRANT_API_KEY to
+    already be set.
+    """
+
+    global _client
+
+    if _client is None:
+        _client = QdrantClient(
+            url=os.environ["QDRANT_URL"],
+            api_key=os.environ["QDRANT_API_KEY"],
+        )
+
+    return _client
 
 
 def create_collection():
@@ -31,13 +48,13 @@ def create_collection():
     Create the Qdrant collection if it does not already exist.
     """
 
-    if client.collection_exists(COLLECTION_NAME):
+    if get_client().collection_exists(COLLECTION_NAME):
         print(
             f"Collection '{COLLECTION_NAME}' already exists."
         )
         return
 
-    client.create_collection(
+    get_client().create_collection(
         collection_name=COLLECTION_NAME,
         vectors_config=VectorParams(
             size=768,
@@ -111,7 +128,7 @@ def upsert_chunks(
 
             # Save any points waiting in the current batch
             if points:
-                client.upsert(
+                get_client().upsert(
                     collection_name=COLLECTION_NAME,
                     points=points,
                 )
@@ -151,7 +168,7 @@ def upsert_chunks(
         # Upsert when batch is full
         if len(points) >= batch_size:
 
-            client.upsert(
+            get_client().upsert(
                 collection_name=COLLECTION_NAME,
                 points=points,
             )
@@ -173,7 +190,7 @@ def upsert_chunks(
     # Upsert remaining chunks
     if points:
 
-        client.upsert(
+        get_client().upsert(
             collection_name=COLLECTION_NAME,
             points=points,
         )
@@ -264,7 +281,7 @@ async def main():
     )
 
     # 5. Check total number of points
-    count = client.count(
+    count = get_client().count(
         collection_name=COLLECTION_NAME,
     )
 

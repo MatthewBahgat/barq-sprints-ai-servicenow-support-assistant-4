@@ -1,4 +1,4 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from barq_ai_support.ingestion.qdrant_store import (
     generate_point_id,
@@ -45,12 +45,16 @@ def test_different_chunks_have_different_ids():
     "barq_ai_support.ingestion.qdrant_store.create_embedding"
 )
 @patch(
-    "barq_ai_support.ingestion.qdrant_store.client.upsert"
+    "barq_ai_support.ingestion.qdrant_store.get_client"
 )
 def test_upsert_chunks(
-    mock_upsert,
+    mock_get_client,
     mock_create_embedding,
 ):
+    mock_client = MagicMock()
+    mock_get_client.return_value = mock_client
+    mock_upsert = mock_client.upsert
+
     mock_create_embedding.return_value = [0.1] * 768
 
     chunks = [
