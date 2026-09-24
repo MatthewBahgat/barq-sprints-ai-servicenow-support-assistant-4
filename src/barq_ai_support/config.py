@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     # --- Retrieval settings (S2.3) ---
     retrieval_score_threshold: float = 0.75
     retrieval_top_k: int = 5
+    
+        # --- Celery / Redis settings (S3.6) ---
+    celery_broker_url: str = "redis://localhost:6379/0"
+    celery_result_backend: str = "redis://localhost:6379/1"
+
+    # --- Tracing settings (S3.6) ---
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
 
     model_config = SettingsConfigDict(
         env_file=".env",
