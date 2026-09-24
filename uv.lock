@@ -87,7 +87,7 @@ requires-dist = [
     { name = "google-genai", specifier = ">=2.24.0" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "langchain-core", specifier = ">=1.6.3" },
-    { name = "langfuse", specifier = ">=2.53.0" },
+    { name = "langfuse", specifier = ">=2.60.0" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "python-dotenv", specifier = ">=1.1.0" },
     { name = "python-dotenv", specifier = ">=1.2.3" },
