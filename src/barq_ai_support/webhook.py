@@ -9,11 +9,20 @@ Also fixes a real gap found during review: the Business Rule
 (businessRule/business_rule.js) sends an "X-ServiceNow-Secret" header,
 but the original webhook never checked it. Anyone who found the ngrok
 URL could POST fake incidents. This version validates that header.
+
+S3.6 UPDATE: handle_event() now enqueues the real Celery task instead of
+just printing. This is a stub standing in for the real FastAPI receiver +
+Redis dedup + Celery consumer task (a teammate's not-yet-merged branch,
+which also owns claiming the incident via ai_status=in_progress before
+this point). No dedup gate here yet -- every webhook call enqueues a new
+task. Swap this for the real dedup+claim consumer once that branch
+lands; the Celery task name/payload shape is the seam.
 """
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
 from pydantic import BaseModel
 
+from .celery_app import process_incident_event
 from .config import settings
 
 router = APIRouter()
@@ -52,7 +61,7 @@ async def webhook(
 
 
 def handle_event(payload: IncidentEvent) -> None:
-    # Sprint 1 scope ends here: just prove the event was received.
-    # Retrieval, agent reasoning, and write-back are wired in later sprints
-    # (see src/barq_ai_support/ingestion, retrieval, and agent packages).
-    print(f"Background task ran for {payload.number}: {payload.short_description}")
+    # STUB (see module docstring): enqueues the Celery task directly, no
+    # dedup gate, no claim PATCH. Real receiver logic is a teammate's task.
+    task = process_incident_event.delay(payload.model_dump())
+    print(f"Enqueued Celery task {task.id} for {payload.number}: {payload.short_description}")

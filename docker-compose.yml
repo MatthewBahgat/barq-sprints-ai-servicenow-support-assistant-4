@@ -33,6 +33,7 @@ services:
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
+      PYTHONUNBUFFERED: "1"
     ports:
       - "8000:8000"
     depends_on:
@@ -49,6 +50,7 @@ services:
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
+      PYTHONUNBUFFERED: "1"
     depends_on:
       redis:
         condition: service_healthy
