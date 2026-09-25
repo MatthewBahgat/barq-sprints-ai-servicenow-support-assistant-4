@@ -314,6 +314,7 @@ async def run_agent_loop(
     sn_client: ServiceNowClient,
     llm: Any | None = None,
     max_steps: int | None = None,
+    on_tool_call: Any | None = None,
 ) -> dict[str, Any]:
     """
     Run the bounded ReAct loop for one already-fetched incident.
@@ -322,6 +323,10 @@ async def run_agent_loop(
     or the fail-safe escalation if the step budget was exhausted first).
     Does not itself catch exceptions - process_incident_event() is the
     top-level boundary that does that.
+
+    on_tool_call, if provided, is called as on_tool_call(tool_name, args,
+    result) after every tool call (both non-terminal and terminal) - purely
+    for observability/demo purposes, has no effect on the loop's behavior.
     """
     if llm is None:
         llm = _build_llm()
@@ -364,6 +369,9 @@ async def run_agent_loop(
 
             result = await tool_obj.ainvoke(call["args"])
             messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+
+            if on_tool_call is not None:
+                on_tool_call(tool_name, call["args"], result)
 
             if tool_name in TERMINAL_TOOL_NAMES:
                 return run.terminal_result
