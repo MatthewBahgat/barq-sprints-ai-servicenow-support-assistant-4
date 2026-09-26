@@ -1,30 +1,9 @@
-"""
-S3.6 — Distributed tracing via Langfuse.
-
-Provides `traced_incident_run()`: wraps one incident's handling in a
-single Langfuse trace containing four child spans, matching the sprint
-spec's required shape exactly: incident fetch, retrieval, model call,
-writeback.
-
-STUB NOTICE: the fetch and writeback spans are stubs. The real Table API
-fetch belongs to the Celery worker task (teammate branch, not merged),
-and the real ServiceNow writeback PATCH isn't implemented anywhere yet
-either. Both spans are still real, meaningful trace entries -- they log
-exactly what the real call's input/output would look like -- they just
-don't make a network call. The retrieval span calls the REAL retrieval
-code (retriever.retrieve) against the live Qdrant collection. Swap the
-fetch/writeback span bodies for real API calls once available; the span
-names and structure are the seam -- nothing else needs to change.
-
-Requires LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST in
-.env (see .env.example). If unset, get_langfuse_client() will construct
-a client that fails silently on flush -- check your Langfuse project's
-Traces tab if nothing shows up.
-"""
+"""S3.6 — Distributed tracing via Langfuse."""
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 from langfuse import Langfuse
 
@@ -33,15 +12,85 @@ from .config import settings
 _langfuse: Langfuse | None = None
 
 
+def tracing_enabled() -> bool:
+    """Return True when all required Langfuse configuration exists."""
+
+    return bool(
+        settings.langfuse_public_key
+        and settings.langfuse_secret_key
+        and settings.langfuse_host
+    )
+
+
 def get_langfuse_client() -> Langfuse:
+    """Return the shared Langfuse client."""
+
     global _langfuse
+
     if _langfuse is None:
         _langfuse = Langfuse(
             public_key=settings.langfuse_public_key,
             secret_key=settings.langfuse_secret_key,
             host=settings.langfuse_host,
         )
+
     return _langfuse
+
+
+@contextmanager
+def incident_trace(
+    payload: dict[str, Any],
+) -> Iterator[Any]:
+    """
+    Create the parent incident trace.
+
+    All child observations created while this context is active become
+    nested under the incident-run trace.
+    """
+
+    if not tracing_enabled():
+        yield None
+        return
+
+    lf = get_langfuse_client()
+
+    name = (
+        payload.get("number")
+        or payload.get("sys_id")
+        or "UNKNOWN"
+    )
+
+    with lf.start_as_current_observation(
+        name=f"incident-run-{name}",
+        as_type="chain",
+        input=payload,
+    ) as trace:
+        try:
+            yield trace
+        finally:
+            lf.flush()
+
+
+@contextmanager
+def observation(
+    name: str,
+    as_type: str,
+    input_data: Any,
+) -> Iterator[Any]:
+    """Create a nested Langfuse observation."""
+
+    if not tracing_enabled():
+        yield None
+        return
+
+    lf = get_langfuse_client()
+
+    with lf.start_as_current_observation(
+        name=name,
+        as_type=as_type,
+        input=input_data,
+    ) as span:
+        yield span
 
 
 def traced_incident_run(
@@ -52,73 +101,75 @@ def traced_incident_run(
     decide_fn: Callable[[Any], dict[str, Any]],
 ) -> dict[str, Any]:
     """
-    Run one incident through fetch -> retrieval -> model -> writeback,
-    all nested under a single trace named after the incident number.
+    Backwards-compatible tracing helper used by the benchmark/demo.
 
-    retrieve_fn(query, category) -> RetrievalResult (e.g. retriever.retrieve)
-    decide_fn(RetrievalResult) -> dict with at least {"outcome", "confidence"}
+    The production agent uses incident_trace() and observation() directly.
     """
-    lf = get_langfuse_client()
-    number = incident.get("number", "UNKNOWN")
 
-    with lf.start_as_current_observation(
-        name=f"incident-run-{number}", as_type="chain", input=incident
-    ) as trace:
+    with incident_trace(incident) as trace:
 
-        # --- span 1: incident fetch (STUB) ---
-        with lf.start_as_current_observation(
-            name="incident-fetch", as_type="tool", input={"number": number}
-        ) as fetch_span:
-            # STUB: real fetch is an authenticated Table API GET owned by
-            # the Celery worker task. The incident is already in hand
-            # here (benchmark dataset / demo payload), so this span
-            # documents the step's shape without a real network call.
-            fetch_span.update(output=incident)
+        with observation(
+            "incident-fetch",
+            "tool",
+            {"number": incident.get("number")},
+        ) as span:
+            if span is not None:
+                span.update(output=incident)
 
-        # --- span 2: retrieval (REAL) ---
-        with lf.start_as_current_observation(
-            name="kb-retrieval",
-            as_type="retriever",
-            input={"query": query, "category": category},
-        ) as retrieval_span:
-            result = retrieve_fn(query=query, category=category)
-            retrieval_span.update(
-                output={
-                    "retrieved_articles": [c.article_number for c in result.chunks],
-                    "best_score": result.best_score,
-                }
+        with observation(
+            "kb-retrieval",
+            "retriever",
+            {
+                "query": query,
+                "category": category,
+            },
+        ) as span:
+
+            result = retrieve_fn(
+                query=query,
+                category=category,
             )
 
-        # --- span 3: model / agent decision ---
-        with lf.start_as_current_observation(
-            name="agent-decision",
-            as_type="generation",
-            model="stub-threshold-gate",
-            input={"retrieved_articles": [c.article_number for c in result.chunks]},
-        ) as model_span:
+            if span is not None:
+                span.update(
+                    output={
+                        "retrieved_articles": [
+                            chunk.article_number
+                            for chunk in result.chunks
+                        ],
+                        "best_score": result.best_score,
+                    }
+                )
+
+        with observation(
+            "agent-decision",
+            "generation",
+            {
+                "retrieved_articles": [
+                    chunk.article_number
+                    for chunk in result.chunks
+                ],
+            },
+        ) as span:
+
             decision = decide_fn(result)
-            model_span.update(output=decision)
 
-        # --- span 4: writeback (STUB) ---
-        writeback_payload = {
-            "ai_status": decision["outcome"],
-            "ai_confidence": decision["confidence"],
-            "human_review_required": True,
-            "ai_processed": True,
-        }
-        with lf.start_as_current_observation(
-            name="servicenow-writeback",
-            as_type="tool",
-            input={"incident_number": number, "fields": writeback_payload},
-        ) as writeback_span:
-            # STUB: real writeback is an authenticated Table API PATCH
-            # scoped to the AI fields (ai_status, ai_suggested_response,
-            # ai_confidence, human_review_required, ai_processed), per
-            # the sprint spec. Not implemented anywhere yet -- this span
-            # logs the exact payload shape that call will send.
-            writeback_span.update(output=writeback_payload)
+            if span is not None:
+                span.update(output=decision)
 
-        trace.update(output=decision)
+        with observation(
+            "servicenow-writeback",
+            "tool",
+            {
+                "incident_number": incident.get("number"),
+                "fields": decision,
+            },
+        ) as span:
 
-    lf.flush()
+            if span is not None:
+                span.update(output=decision)
+
+        if trace is not None:
+            trace.update(output=decision)
+
     return decision
