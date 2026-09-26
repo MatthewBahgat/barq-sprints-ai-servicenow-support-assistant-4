@@ -23,6 +23,7 @@ from barq_ai_support.agent.s3_worker import (
     run_agent_loop,
 )
 from barq_ai_support.retrieval.retriever import RetrievalResult, RetrievedChunk
+from barq_ai_support.config import settings
 
 
 # ---------------------------------------------------------------------------
@@ -143,10 +144,9 @@ async def test_grounded_run_ends_in_suggest_answer():
     call_args = sn_client.update_incident.await_args
     assert call_args.args[0] == "abc123"
     written_fields = call_args.args[1]
-    assert written_fields["x_2066139_ai_triag_ai_status"] == "suggested"
-    assert written_fields["x_2066139_ai_triag_human_review_required"] is True
-    assert written_fields["x_2066139_ai_triag_ai_processed"] is True
-
+    assert written_fields[f"{settings.ai_field_prefix}ai_status"] == "suggested"
+    assert written_fields[f"{settings.ai_field_prefix}human_review_required"] is True
+    assert written_fields[f"{settings.ai_field_prefix}ai_processed"] is True
 
 @pytest.mark.asyncio
 async def test_confidence_is_bounded_even_if_model_reports_out_of_range():
@@ -183,9 +183,8 @@ async def test_unanswerable_run_ends_in_request_hr():
     assert "No relevant" in result["reason"]
 
     written_fields = sn_client.update_incident.await_args.args[1]
-    assert written_fields["x_2066139_ai_triag_ai_status"] == "escalated"
-    assert written_fields["x_2066139_ai_triag_human_review_required"] is True
-
+    assert written_fields[f"{settings.ai_field_prefix}ai_status"] == "escalated"
+    assert written_fields[f"{settings.ai_field_prefix}human_review_required"] is True
     # Escalation reason is appended as a work note
     sn_client.add_work_note.assert_awaited_once()
     note_text = sn_client.add_work_note.await_args.args[1]
