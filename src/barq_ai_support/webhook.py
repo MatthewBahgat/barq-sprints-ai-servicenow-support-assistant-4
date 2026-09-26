@@ -1,4 +1,3 @@
-
 """S3.6 — authenticated ServiceNow webhook receiver."""
 
 from __future__ import annotations
