@@ -536,7 +536,30 @@ async def run_agent_loop(
 
         for step in range(max_steps):
             run.steps_taken = step + 1
-            ai_msg: AIMessage = await llm_with_tools.ainvoke(messages)
+
+            with observation(
+                "agent-decision",
+                "generation",
+                {
+                    "step": run.steps_taken,
+                    "message_count": len(messages),
+                },
+            ) as span:
+                ai_msg: AIMessage = await llm_with_tools.ainvoke(messages)
+
+                if span is not None:
+                    span.update(
+                        output={
+                            "tool_calls": [
+                                call.get("name")
+                                for call in (getattr(ai_msg, "tool_calls", None) or [])
+                            ],
+                            "has_tool_call": bool(
+                                getattr(ai_msg, "tool_calls", None)
+                            ),
+                        }
+                    )
+
             messages.append(ai_msg)
 
             tool_calls = getattr(ai_msg, "tool_calls", None) or []
