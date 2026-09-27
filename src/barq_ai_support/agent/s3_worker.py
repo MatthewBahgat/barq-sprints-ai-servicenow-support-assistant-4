@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import traceback
+import httpx
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -42,12 +43,42 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from ..config import settings
-from ..retrieval.retriever import retrieve
+from ..retrieval.retriever import default_embedding_fn, gemini_embedding_fn, retrieve
 from ..servicenow_client import ServiceNowClient
 from ..tracing import incident_trace, observation
 
 logger = logging.getLogger(__name__)
 
+def _litellm_proxy_embedding_fn(text: str) -> list[float]:
+    """Real Gemini embeddings via the team's LiteLLM proxy (768-dim)."""
+    import json as _json
+    import os as _os
+    import urllib.request as _urlreq
+
+    base = _os.environ.get("LITELLM_BASE_URL", "")
+    key = _os.environ.get("LITELLM_API_KEY", "")
+    body = _json.dumps(
+        {"model": "gemini/gemini-embedding-001", "input": text, "dimensions": 768}
+    ).encode("utf-8")
+    req = _urlreq.Request(
+        base.rstrip("/") + "/embeddings",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    with _urlreq.urlopen(req, timeout=120) as resp:
+        data = _json.loads(resp.read().decode("utf-8"))
+    return data["data"][0]["embedding"]
+
+
+def _select_embedding_fn():
+    """Same precedence as the benchmark harness: real Gemini key first,
+    then the LiteLLM proxy, then the offline stub as a last resort."""
+    import os
+    if os.environ.get("GEMINI_API_KEY"):
+        return gemini_embedding_fn
+    if os.environ.get("LITELLM_BASE_URL") and os.environ.get("LITELLM_API_KEY"):
+        return _litellm_proxy_embedding_fn
+    return default_embedding_fn
 
 class WorkerConfigError(RuntimeError):
     """Required configuration is missing."""
@@ -282,10 +313,7 @@ def build_tools(
             },
         ) as span:
 
-            result = retrieve(
-                query,
-                score_threshold=0.0,
-            )
+            result = retrieve(query, score_threshold=0.0, embedding_fn=_select_embedding_fn())
 
             if result.chunks:
                 top = max(c.score for c in result.chunks)
@@ -441,17 +469,12 @@ def _build_incident_block(
     )
 
 
-def _build_llm() -> ChatOpenAI:
-    """Build the configured LiteLLM/OpenAI-compatible model."""
-
+def _build_llm(http_client: "httpx.AsyncClient | None" = None) -> ChatOpenAI:
     api_key = settings.openai_api_key.strip()
-
     if not api_key:
         raise WorkerConfigError(
-            "OPENAI_API_KEY is not set. Copy .env.example to .env "
-            "and add your LiteLLM proxy key."
+            "OPENAI_API_KEY is not set. Copy .env.example to .env and add your LiteLLM proxy key."
         )
-
     kwargs: dict[str, Any] = {
         "model": settings.llm_model.strip() or "gemini-3.5-flash",
         "temperature": settings.llm_temperature,
@@ -459,14 +482,19 @@ def _build_llm() -> ChatOpenAI:
         "max_retries": 0,
         "timeout": 90,
     }
-
     base_url = settings.litellm_base_url.strip()
-
     if base_url:
         kwargs["base_url"] = base_url
-
+    if http_client is not None:
+        # Own our async HTTP client explicitly so we can close it in the
+        # SAME event loop that created it (see run_agent_loop's finally
+        # block). This worker reuses its process across many Celery
+        # tasks via asyncio.run() per task; relying on garbage collection
+        # to clean up an implicit client risks it being collected during
+        # a LATER task's event loop, raising "RuntimeError: Event loop
+        # is closed" during cleanup.
+        kwargs["http_async_client"] = http_client
     return ChatOpenAI(**kwargs)
-
 
 async def run_agent_loop(
     incident: dict[str, Any],
@@ -477,136 +505,75 @@ async def run_agent_loop(
 ) -> dict[str, Any]:
     """
     Run the bounded ReAct loop for one already-fetched incident.
+
+    Returns the terminal_result dict (from whichever tool ended the run,
+    or the fail-safe escalation if the step budget was exhausted first).
+    Does not itself catch exceptions - process_incident_event() is the
+    top-level boundary that does that.
+
+    on_tool_call, if provided, is called as on_tool_call(tool_name, args,
+    result) after every tool call (both non-terminal and terminal) - purely
+    for observability/demo purposes, has no effect on the loop's behavior.
     """
-
-    if llm is None:
-        llm = _build_llm()
-
+    owns_llm = llm is None
+    http_client: "httpx.AsyncClient | None" = None
+    if owns_llm:
+        http_client = httpx.AsyncClient()
+        llm = _build_llm(http_client=http_client)
     if max_steps is None:
         max_steps = settings.agent_max_steps
 
-    run = RunState(
-        incident_sys_id=incident["sys_id"],
-    )
+    try:
+        run = RunState(incident_sys_id=incident["sys_id"])
+        tools = build_tools(run, sn_client)
+        tools_by_name = {t.name: t for t in tools}
+        llm_with_tools = llm.bind_tools(tools)
 
-    tools = build_tools(
-        run,
-        sn_client,
-    )
+        messages: list[Any] = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=_build_incident_block(incident)),
+        ]
 
-    tools_by_name = {
-        tool_obj.name: tool_obj
-        for tool_obj in tools
-    }
+        for step in range(max_steps):
+            run.steps_taken = step + 1
+            ai_msg: AIMessage = await llm_with_tools.ainvoke(messages)
+            messages.append(ai_msg)
 
-    llm_with_tools = llm.bind_tools(tools)
-
-    messages: list[Any] = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=_build_incident_block(incident)),
-    ]
-
-    for step in range(max_steps):
-        run.steps_taken = step + 1
-
-        with observation(
-            "agent-decision",
-            "generation",
-            {
-                "step": run.steps_taken,
-                "incident_sys_id": incident["sys_id"],
-                "search_queries": list(run.search_queries),
-            },
-        ) as span:
-
-            ai_msg: AIMessage = await llm_with_tools.ainvoke(
-                messages,
-            )
-
-            if span is not None:
-                tool_calls_for_trace = getattr(
-                    ai_msg,
-                    "tool_calls",
-                    None,
-                ) or []
-
-                span.update(
-                    output={
-                        "tool_calls": [
-                            {
-                                "name": call.get("name"),
-                                "args": call.get("args"),
-                            }
-                            for call in tool_calls_for_trace
-                        ],
-                    }
-                )
-
-        messages.append(ai_msg)
-
-        tool_calls = getattr(
-            ai_msg,
-            "tool_calls",
-            None,
-        ) or []
-
-        if not tool_calls:
-            logger.info(
-                "Agent step %s produced no tool call; continuing.",
-                run.steps_taken,
-            )
-            continue
-
-        for call in tool_calls:
-            tool_name = call["name"]
-
-            tool_obj = tools_by_name.get(tool_name)
-
-            if tool_obj is None:
-                messages.append(
-                    ToolMessage(
-                        content=f"Unknown tool: {tool_name}",
-                        tool_call_id=call["id"],
-                    )
-                )
+            tool_calls = getattr(ai_msg, "tool_calls", None) or []
+            if not tool_calls:
+                logger.info("Agent step %s produced no tool call; continuing.", run.steps_taken)
                 continue
 
-            result = await tool_obj.ainvoke(
-                call["args"],
-            )
+            for call in tool_calls:
+                tool_name = call["name"]
+                tool_obj = tools_by_name.get(tool_name)
+                if tool_obj is None:
+                    messages.append(
+                        ToolMessage(content=f"Unknown tool: {tool_name}", tool_call_id=call["id"])
+                    )
+                    continue
 
-            messages.append(
-                ToolMessage(
-                    content=str(result),
-                    tool_call_id=call["id"],
-                )
-            )
+                result = await tool_obj.ainvoke(call["args"])
+                messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
 
-            if on_tool_call is not None:
-                on_tool_call(
-                    tool_name,
-                    call["args"],
-                    result,
-                )
+                if on_tool_call is not None:
+                    on_tool_call(tool_name, call["args"], result)
 
-            if tool_name in TERMINAL_TOOL_NAMES:
-                return run.terminal_result
+                if tool_name in TERMINAL_TOOL_NAMES:
+                    return run.terminal_result
 
-    logger.warning(
-        "Agent exhausted %s steps on incident %s without a terminal "
-        "decision; fail-safe escalating.",
-        max_steps,
-        run.incident_sys_id,
-    )
-
-    return await _terminal_request_hr(
-        run,
-        sn_client,
-        reason=(
-            f"Fail-safe: exceeded {max_steps}-step budget "
-            "without a decision."
-        ),
-    )
+        logger.warning(
+            "Agent exhausted %s steps on incident %s without a terminal decision; "
+            "fail-safe escalating.",
+            max_steps,
+            run.incident_sys_id,
+        )
+        return await _terminal_request_hr(
+            run, sn_client, reason=f"Fail-safe: exceeded {max_steps}-step budget without a decision."
+        )
+    finally:
+        if http_client is not None:
+            await http_client.aclose()
 
 
 async def process_incident_event(
