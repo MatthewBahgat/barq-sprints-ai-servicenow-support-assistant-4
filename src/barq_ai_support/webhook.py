@@ -1,118 +1,96 @@
-"""S3.6 — authenticated ServiceNow webhook receiver."""
+"""
+S3.3 — Incident receiver with HMAC-SHA256 verification, Redis dedup,
+and Celery dispatch.
 
-from __future__ import annotations
+Order of operations (do not reorder):
+  1. Read raw body bytes.
+  2. Verify HMAC-SHA256 signature over those raw bytes, constant-time.
+     Bad/missing signature -> 401, before any JSON parsing.
+  3. Parse + validate JSON (Pydantic).
+  4. Dedup check (Redis SETNX-equivalent). Replay -> 202, no Celery task.
+  5. First-seen -> enqueue Celery task, return 202.
 
+The endpoint never runs agent/retrieval/embedding work itself, and never
+calls ServiceNow directly — claiming the incident happens inside the
+Celery task, not here.
+"""
 import hashlib
 import hmac
-import json
+import secrets as secrets_module
 
-import redis.asyncio as redis
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Request, Response, status
+from pydantic import BaseModel, ValidationError
+import redis
 
-from .celery_app import process_incident_event
 from .config import settings
 
 router = APIRouter()
 
+_redis_client: redis.Redis | None = None
 
-def _verify_signature(
-    raw_body: bytes,
-    signature: str | None,
-) -> None:
-    """Verify HMAC-SHA256 against the exact raw request body."""
 
-    if not settings.servicenow_webhook_secret:
-        raise HTTPException(
-            status_code=500,
-            detail="Webhook secret is not configured",
-        )
+def _get_redis() -> redis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+    return _redis_client
 
-    if not signature:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing X-Signature",
-        )
 
-    supplied = signature.removeprefix("sha256=")
+class IncidentEvent(BaseModel):
+    incident_sys_id: str
+    number: str
+    short_description: str
+    description: str | None = ""
+    event_id: str  # required for dedup — must be unique per event
 
+
+def _verify_signature(raw_body: bytes, provided_signature: str | None) -> bool:
+    """Constant-time HMAC-SHA256 verification over raw request bytes."""
+    if not provided_signature:
+        return False
     expected = hmac.new(
-        settings.servicenow_webhook_secret.encode("utf-8"),
-        raw_body,
-        hashlib.sha256,
+        key=settings.incident_signing_secret.encode("utf-8"),
+        msg=raw_body,
+        digestmod=hashlib.sha256,
     ).hexdigest()
-
-    if not hmac.compare_digest(supplied, expected):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid signature",
-        )
+    try:
+        return secrets_module.compare_digest(expected, provided_signature)
+    except TypeError:
+        return False
 
 
-@router.post("/webhook", status_code=202)
-async def webhook(
-    request: Request,
-    x_signature: str | None = Header(default=None),
-):
-    """Receive, authenticate, deduplicate, and enqueue a ServiceNow event."""
+def _claim_event_once(event_id: str) -> bool:
+    """
+    Atomically claim an event_id in Redis. Returns True if this is the
+    first time we've seen it (should process), False if it's a replay.
+    """
+    client = _get_redis()
+    key = f"{settings.dedup_key_prefix}{event_id}"
+    was_set = client.set(key, "1", nx=True, ex=settings.dedup_ttl_seconds)
+    return bool(was_set)
 
+
+@router.post("/api/v1/events/servicenow", status_code=202)
+async def receive_incident_event(request: Request):
     raw_body = await request.body()
+    signature = request.headers.get("X-Signature")
 
-    _verify_signature(raw_body, x_signature)
-
-    try:
-        payload = json.loads(raw_body)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid JSON",
-        ) from exc
-
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=400,
-            detail="Webhook body must be a JSON object",
-        )
-
-    sys_id = payload.get("sys_id") or payload.get("incident_sys_id")
-
-    if not sys_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing sys_id",
-        )
-
-    redis_client = redis.from_url(
-        settings.celery_broker_url,
-        decode_responses=True,
-    )
+    if not _verify_signature(raw_body, signature):
+        return Response(status_code=status.HTTP_401_UNAUTHORIZED)
 
     try:
-        dedup_key = f"barq:s3.6:webhook:{sys_id}"
+        payload = IncidentEvent.model_validate_json(raw_body)
+    except ValidationError:
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
 
-        claimed = await redis_client.set(
-            dedup_key,
-            "1",
-            nx=True,
-            ex=24 * 60 * 60,
-        )
+    is_first_seen = _claim_event_once(payload.event_id)
 
-        if not claimed:
-            return {
-                "status": "duplicate",
-                "sys_id": sys_id,
-            }
+    if not is_first_seen:
+        print(f"Duplicate event_id={payload.event_id}, ack without dispatch")
+        return Response(status_code=status.HTTP_202_ACCEPTED)
 
-        process_incident_event.delay(
-            {
-                "sys_id": sys_id,
-                "number": payload.get("number", ""),
-            }
-        )
+    from .tasks import process_incident  # local import avoids circular import at module load
+    process_incident.delay(payload.model_dump())
 
-        return {
-            "status": "accepted",
-            "sys_id": sys_id,
-        }
-
-    finally:
-        await redis_client.aclose()
+    print(f"Dispatched event_id={payload.event_id} sys_id={payload.incident_sys_id} to Celery")
+    return {"status": "accepted", "number": payload.number}
