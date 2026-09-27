@@ -1,20 +1,49 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
+*.py[cod]
+*$py.class
+*.so
+.Python
 .venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# uv
+.uv/
 
 # Environment variables / secrets
 .env
-# Local test scratch files
-payload_test*.json
-claim_test.json
 
 # Local test scratch files
 payload_test*.json
 claim_test.json
+
+# Log and output files
+*.log
+*.jsonl
+*.jsonl.tmp
+out/
+benchmark/benchmark_results.json
+
+# Test fixtures and generated PDFs
+challenge/barq_challenge.pdf
+challenge-heldout/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
