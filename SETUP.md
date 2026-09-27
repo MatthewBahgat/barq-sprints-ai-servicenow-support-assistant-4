@@ -28,7 +28,9 @@ be real. `AI_FIELD_PREFIX` must match the scoped field prefix on your specific S
 instance (System Definition > Dictionary, filter Table=incident — every intern's PDI has a
 different scope number). `OPENAI_API_KEY` must be set to the same LiteLLM proxy key as
 `LITELLM_API_KEY` (the agent's LLM client reads a different env var name than the retrieval
-scripts do for the same underlying credential).
+scripts do for the same underlying credential). `INCIDENT_SIGNING_SECRET` (and
+`KB_SIGNING_SECRET` for the KB sync path) are the current signing secrets — do not use the old
+`SERVICENOW_WEBHOOK_SECRET`, which no longer matches the live receiver contract.
 
 ## 2. Install dependencies
 ```bash
@@ -57,28 +59,41 @@ curl localhost:8000/health   # {"status": "ok"}
 ```
 
 ## 5. Run an end-to-end incident
-The webhook now verifies a real HMAC-SHA256 signature over the raw request body (matching
-the ServiceNow eligibility Business Rule's signing contract) — not a plain shared-secret
-header. With the stack running, in a second terminal (PowerShell example):
-```powershell
-$secret = "<your SERVICENOW_WEBHOOK_SECRET value>"
-$body = '{"sys_id":"<a real Incident sys_id from your PDI>","number":"INC0099001","short_description":"No internet connection","description":"User cannot reach any websites"}'
-$hmac = New-Object System.Security.Cryptography.HMACSHA256
-$hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($secret)
-$sig = [System.BitConverter]::ToString($hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($body))).Replace("-","").ToLower()
-curl -X POST localhost:8000/webhook -H "Content-Type: application/json" -H "X-Signature: $sig" -d $body
+
+**Endpoint:** `POST /api/v1/events/servicenow`
+
+**Payload shape:**
+```json
+{
+  "event_id": "<any unique string, e.g. a GUID — this is the dedup key>",
+  "incident_sys_id": "<a real Incident record's sys_id on your PDI>",
+  "number": "INC00xxxxx",
+  "short_description": "...",
+  "description": "..."
+}
 ```
-`sys_id` must be a real Incident record's sys_id on your ServiceNow PDI — the worker fetches
-the incident for real via the Table API, so a fake sys_id will fail at that step (the failure
-is handled cleanly: logged, a work note attempted, incident left `in_progress` for retry).
 
-The API returns `202 Accepted` immediately. Watch `docker compose logs worker -f` to see the
-real agent run: fetch (real Table API GET) -> ReAct loop over searchKB/addWorkNote (real
-Qdrant retrieval) -> terminal suggestAnswer or requestHR -> real writeback (one atomic PATCH
-to the scoped AI fields on the incident, matching `AI_FIELD_PREFIX`).
+The receiver verifies an HMAC-SHA256 signature computed over the **exact raw request body**,
+sent in the `X-Signature` header (lowercase hex digest, no `sha256=` prefix). The signing
+secret is `INCIDENT_SIGNING_SECRET` from `.env` — must match on both the sender and receiver
+side.
 
-Sending the same `sys_id` twice returns `{"status": "duplicate"}` on the second call (Redis
-SETNX dedup, 24h expiry) rather than enqueueing a second run.
+A PowerShell helper script, `test_webhook.ps1`, builds the payload, computes the signature,
+and sends the request in one step — the reliable way to test this locally (a native `curl.exe`
+one-liner reliably mangles the JSON body's quoting on Windows; don't fight it, use the script):
+```powershell
+.\test_webhook.ps1
+```
+Edit the `$sysId` variable inside it to point at a real Incident sys_id first.
+
+**Dedup behavior:** the dedup key is `evt:{event_id}` in Redis (24h expiry). Sending the same
+`event_id` again returns `202 Accepted` with an **empty response body** — not a `"duplicate"`
+JSON payload — since the request was already fully handled the first time.
+
+Watch `docker compose logs worker -f` to see the real agent run: fetch (real Table API GET) ->
+ReAct loop over searchKB/addWorkNote (real Qdrant retrieval) -> terminal suggestAnswer or
+requestHR -> real writeback (one atomic PATCH to the scoped AI fields on the incident, matching
+`AI_FIELD_PREFIX`).
 
 ## 6. Run the benchmark harness
 ```bash
@@ -93,7 +108,10 @@ uv run python benchmark/traced_demo_run.py
 ```
 Sends a couple of traced incident runs to Langfuse. Check your project's **Traces** tab —
 each run should show one trace with 4 nested spans (`incident-fetch`, `kb-retrieval`,
-`agent-decision`, `servicenow-writeback`).
+`agent-decision`, `servicenow-writeback`). This same 4-span structure now also appears on
+real live runs through the `/api/v1/events/servicenow` path (Step 5) — the production
+`run_agent_loop()` wraps its real LLM call in the `agent-decision` span, not just this
+standalone demo script.
 
 ## Known stubs / open items (see individual file headers for details)
 - **KB content**: fixture articles (`seed_fixtures.py`), not the real ServiceNow knowledge
@@ -104,11 +122,19 @@ each run should show one trace with 4 nested spans (`incident-fetch`, `kb-retrie
   decision layer, separate from the real agent above — it evaluates retrieval quality
   directly rather than invoking the full LLM agent per benchmark case (would be slow/costly
   to run the real agent 30x per benchmark run). This is intentional, not a gap to fix.
+- **`businessRule/business_rule.js`** (the real ServiceNow-side HMAC sender) is not part of
+  this PR — the receiver above has been verified against a manually-signed test request
+  (`test_webhook.ps1`), not against the actual ServiceNow Business Rule's output. These should
+  produce identical signatures given the same secret and body, but that hasn't been confirmed
+  end-to-end from a real ServiceNow-triggered event yet.
 
 ## Resolved since the last revision (real, not stubbed anymore)
 - **Agent decision**: the real S3.4 ReAct agent (searchKB/addWorkNote/suggestAnswer/
   requestHR via `agent/s3_worker.py`) is merged and wired into the Celery task — no more
   threshold-gate stand-in in the live pipeline.
-- **Celery consumer**: real Redis SETNX dedup (24h expiry) and real incident claim (PATCH
-  `ai_status=in_progress`) before the agent runs.
+- **Celery consumer**: real Redis SETNX dedup (24h expiry, `evt:` key prefix) and real
+  incident claim (PATCH `ai_status=in_progress`) before the agent runs.
 - **Writeback**: real, atomic Table API PATCH to the scoped AI fields — not a log-only stub.
+- **Tracing**: the real production `run_agent_loop()` now wraps its actual LLM call in the
+  `agent-decision` span — a live run produces the full 4-span structure, not just the
+  standalone benchmark/demo tracing helper.
