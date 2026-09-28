@@ -9,6 +9,9 @@ Order of operations (do not reorder):
   3. Parse + validate JSON (Pydantic).
   4. Dedup check (Redis SETNX-equivalent). Replay -> 202, no Celery task.
   5. First-seen -> enqueue Celery task, return 202.
+     If the enqueue FAILS, release the dedup claim from step 4 and return
+     503, so the sender's retry of the same event_id is processed instead of
+     being mistaken for a duplicate (and silently dropped) for the whole TTL.
 
 The endpoint never runs agent/retrieval/embedding work itself, and never
 calls ServiceNow directly — claiming the incident happens inside the
@@ -16,6 +19,7 @@ Celery task, not here.
 """
 import hashlib
 import hmac
+import logging
 import secrets as secrets_module
 
 from fastapi import APIRouter, Request, Response, status
@@ -23,6 +27,8 @@ from pydantic import BaseModel, ValidationError
 import redis
 
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -59,15 +65,32 @@ def _verify_signature(raw_body: bytes, provided_signature: str | None) -> bool:
         return False
 
 
+def _dedup_key(event_id: str) -> str:
+    return f"{settings.dedup_key_prefix}{event_id}"
+
+
 def _claim_event_once(event_id: str) -> bool:
     """
     Atomically claim an event_id in Redis. Returns True if this is the
     first time we've seen it (should process), False if it's a replay.
     """
     client = _get_redis()
-    key = f"{settings.dedup_key_prefix}{event_id}"
-    was_set = client.set(key, "1", nx=True, ex=settings.dedup_ttl_seconds)
+    was_set = client.set(_dedup_key(event_id), "1", nx=True, ex=settings.dedup_ttl_seconds)
     return bool(was_set)
+
+
+def _release_event_claim(event_id: str) -> None:
+    """
+    Undo _claim_event_once, so a redelivery of the same event_id is treated
+    as first-seen. Best effort: if Redis is itself what's failing, the claim
+    simply expires at its TTL — logged loudly rather than raised, so it can
+    never mask the original dispatch error.
+    """
+    key = _dedup_key(event_id)
+    try:
+        _get_redis().delete(key)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Could not release dedup claim %s (expires at TTL): %s", key, exc)
 
 
 @router.post("/api/v1/events/servicenow", status_code=202)
@@ -89,8 +112,25 @@ async def receive_incident_event(request: Request):
         print(f"Duplicate event_id={payload.event_id}, ack without dispatch")
         return Response(status_code=status.HTTP_202_ACCEPTED)
 
-    from .tasks import process_incident  # local import avoids circular import at module load
-    process_incident.delay(payload.model_dump())
+    try:
+        # local import avoids circular import at module load
+        from .tasks import process_incident
+
+        process_incident.delay(payload.model_dump())
+    except Exception:  # noqa: BLE001
+        # Nothing reached a worker. Give the event back so the sender's
+        # retry isn't swallowed as a "duplicate".
+        _release_event_claim(payload.event_id)
+        logger.error(
+            "Dispatch failed for event_id=%s sys_id=%s; dedup claim released",
+            payload.event_id,
+            payload.incident_sys_id,
+            exc_info=True,
+        )
+        return Response(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "30"},
+        )
 
     print(f"Dispatched event_id={payload.event_id} sys_id={payload.incident_sys_id} to Celery")
     return {"status": "accepted", "number": payload.number}
