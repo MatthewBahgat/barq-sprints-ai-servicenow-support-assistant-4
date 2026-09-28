@@ -54,6 +54,8 @@ def _verify_signature(raw_body: bytes, provided_signature: str | None) -> bool:
     """Constant-time HMAC-SHA256 verification over raw request bytes."""
     if not provided_signature:
         return False
+    if not settings.incident_signing_secret:  
+        return False  
     expected = hmac.new(
         key=settings.incident_signing_secret.encode("utf-8"),
         msg=raw_body,

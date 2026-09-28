@@ -143,3 +143,16 @@ def test_webhook_rejects_missing_required_field():
         headers={"Content-Type": "application/json", "X-Signature": signature},
     )
     assert r.status_code == 400
+
+def test_webhook_rejects_when_no_secret_configured(monkeypatch):
+    """With no signing secret configured, fail closed: a request signed
+    with an empty key must NOT be accepted."""
+    monkeypatch.setattr(settings, "incident_signing_secret", "")
+    body = json.dumps(_payload(), separators=(",", ":")).encode("utf-8")
+    signature = _sign(body, "")
+    r = client.post(
+        "/api/v1/events/servicenow",
+        content=body,
+        headers={"Content-Type": "application/json", "X-Signature": signature},
+    )
+    assert r.status_code == 401
