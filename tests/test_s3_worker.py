@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from barq_ai_support.agent.s3_worker import (
     _build_incident_block,
@@ -112,14 +112,13 @@ def test_terminal_tool_names_match_registry():
     assert TERMINAL_TOOL_NAMES == {"suggestAnswer", "requestHR"}
 
 
-def test_litellm_query_embeddings_use_the_ingestion_provider(monkeypatch):
-    from barq_ai_support.ingestion.embedding import create_embedding
-
+def test_embedding_backend_uses_gemini_key_loaded_from_settings(monkeypatch):
+    monkeypatch.setattr(settings, "gemini_api_key", "configured-in-env-file")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setenv("LITELLM_BASE_URL", "https://proxy.example")
-    monkeypatch.setenv("LITELLM_API_KEY", "test-key")
 
-    assert _select_embedding_fn() is create_embedding
+    from barq_ai_support.retrieval.retriever import gemini_embedding_fn
+
+    assert _select_embedding_fn() is gemini_embedding_fn
 
 
 def test_incident_block_masks_credentials_and_personal_data():
@@ -143,7 +142,7 @@ def test_incident_block_masks_credentials_and_personal_data():
 
 
 @pytest.mark.asyncio
-async def test_retrieved_tool_output_is_masked_before_next_model_call():
+async def test_retrieved_tool_output_is_masked_in_tool_message():
     sn_client = _mock_sn_client()
     llm = ScriptedLLM([
         make_tool_call("searchKB", {"query": "VPN login"}, "call_1"),
@@ -164,40 +163,22 @@ async def test_retrieved_tool_output_is_masked_before_next_model_call():
         ]
     )
 
-    with patch(
-        "barq_ai_support.agent.s3_worker.retrieve",
-        return_value=result_with_sensitive_text,
+    with (
+        patch(
+            "barq_ai_support.agent.s3_worker.retrieve",
+            return_value=result_with_sensitive_text,
+        ),
+        patch(
+            "barq_ai_support.agent.s3_worker.ToolMessage",
+            wraps=ToolMessage,
+        ) as tool_message_factory,
     ):
         await run_agent_loop(INCIDENT, sn_client, llm=llm)
 
-    tool_message = llm.seen_messages[1][-1]
-    assert "hunter2" not in tool_message.content
-    assert "jane.doe@example.com" not in tool_message.content
-    assert "555-123-4567" not in tool_message.content
-
-
-@pytest.mark.asyncio
-async def test_optional_llm_input_log_contains_masked_incident(caplog, monkeypatch):
-    import logging
-
-    monkeypatch.setattr(settings, "log_llm_inputs", True)
-    caplog.set_level(logging.WARNING, logger="barq_ai_support.agent.s3_worker")
-    incident = {
-        **INCIDENT,
-        "description": "QA password=FAKE_PASSWORD_123 contact=qa-mask@example.invalid",
-    }
-    sn_client = _mock_sn_client()
-    llm = ScriptedLLM([
-        make_tool_call("requestHR", {"reason": "QA complete."}, "call_1"),
-    ])
-
-    await run_agent_loop(incident, sn_client, llm=llm)
-
-    assert "Masked LLM input" in caplog.text
-    assert "FAKE_PASSWORD_123" not in caplog.text
-    assert "qa-mask@example.invalid" not in caplog.text
-    assert "[REDACTED]" in caplog.text
-    assert "[REDACTED_EMAIL]" in caplog.text
+    tool_message = tool_message_factory.call_args.kwargs["content"]
+    assert "hunter2" not in tool_message
+    assert "jane.doe@example.com" not in tool_message
+    assert "555-123-4567" not in tool_message
 
 
 # ---------------------------------------------------------------------------

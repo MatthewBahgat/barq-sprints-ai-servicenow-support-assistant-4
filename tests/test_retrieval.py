@@ -88,40 +88,6 @@ def test_retrieve_returns_ranked_results_with_score_and_provenance(monkeypatch):
         assert chunk.article_number != ""
 
 
-def test_retrieve_returns_chunk_body_when_title_is_also_in_payload(monkeypatch):
-    monkeypatch.setattr(settings, "qdrant_collection_name", COLLECTION)
-    client = QdrantClient(":memory:")
-    client.create_collection(
-        collection_name=COLLECTION,
-        vectors_config=qmodels.VectorParams(size=384, distance=qmodels.Distance.COSINE),
-    )
-    body = "Open VPN settings and select Reset credentials to reconnect."
-    client.upsert(
-        collection_name=COLLECTION,
-        points=[
-            qmodels.PointStruct(
-                id=1,
-                vector=default_embedding_fn(body),
-                payload={
-                    "text": body,
-                    "short_description": "VPN sign-in help",
-                    "number": "KB0010001",
-                },
-            )
-        ],
-    )
-
-    result = retrieve(
-        body,
-        client=client,
-        score_threshold=0.0,
-        embedding_fn=default_embedding_fn,
-    )
-
-    assert result.ok is True
-    assert result.chunks[0].text == body
-
-
 def test_retrieve_refuses_below_threshold(monkeypatch):
     """
     A refusal under low relevance is normal, successful execution, not

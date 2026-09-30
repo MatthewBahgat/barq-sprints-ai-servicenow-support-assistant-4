@@ -33,7 +33,6 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     llm_model: str = "gemini/gemini-3.5-flash-lite"
     llm_temperature: float = 0.0
-    log_llm_inputs: bool = False
 
     # --- S3.4 worker settings ---
     # The application scope prefix for the AI fields on the incident table

@@ -165,9 +165,10 @@ def retrieve(
         for hit in hits
     ]
 
-    best_score = max((c.score for c in chunks), default=None)
+    best_chunk = max(chunks, key=lambda chunk: chunk.score, default=None)
+    best_score = best_chunk.score if best_chunk is not None else None
 
-    if best_score is None or best_score < score_threshold:
+    if best_score is None or best_score <= score_threshold:
         refusal_message = (
             f"No relevant knowledge articles found for query: {query!r}. "
             f"Best score achieved: {best_score}, "
