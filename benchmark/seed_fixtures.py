@@ -198,7 +198,7 @@ def main() -> None:
     for i, chunk in enumerate(chunks, 1):
         vector = embedding_fn(chunk["text"])
         points.append(
-            PointStruct(id=generate_point_id(chunk), vector=vector, payload=chunk["metadata"])
+            PointStruct(id=generate_point_id(chunk), vector=vector, payload={**chunk["metadata"], "text": chunk["text"]})
         )
         print(f"  embedded {i}/{len(chunks)}: {chunk['metadata']['number']} (chunk {chunk['metadata']['chunk_index']})")
 

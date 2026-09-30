@@ -104,17 +104,27 @@ class ServiceNowClient:
 
         return data.get("result", [])
 
-    async def claim_incident(self, sys_id: str, status_value: str = "in_progress") -> dict[str, Any]:
+    async def claim_incident(
+        self,
+        sys_id: str,
+        status_value: str = "in_progress",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         """
         S3.3 — Claim an incident by PATCHing the AI status field before agent execution.
         Field name is scoped to this instance's custom app (x_2215387_sprint_0_ai_status),
         not a generic 'ai_status' — confirmed via direct API testing.
+
+        `timeout` is optional and overrides the client's default 20s timeout.
+        Pass a short value (e.g. 3.0) when calling this synchronously from a
+        webhook handler, so a slow ServiceNow response can't block that
+        request indefinitely.
         """
         url = f"{self.base_url}/api/now/table/incident/{sys_id}"
 
         async with httpx.AsyncClient(
             auth=self.auth,
-            timeout=self.timeout,
+            timeout=timeout or self.timeout,
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         ) as client:
             response = await client.patch(url, json={"x_2215387_sprint_0_ai_status": status_value})

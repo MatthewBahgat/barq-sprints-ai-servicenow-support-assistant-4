@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     qdrant_collection_name: str = "barq_kb_chunks"
 
     # --- Retrieval settings (S2.3) ---
-    retrieval_score_threshold: float = 0.75
+    retrieval_score_threshold: float = 0.4
     retrieval_top_k: int = 5
 
     # --- Tracing settings (S3.6) ---
@@ -31,8 +31,9 @@ class Settings(BaseSettings):
     # provider prefix for the proxy to route correctly.
     litellm_base_url: str = ""
     openai_api_key: str = ""
-    llm_model: str = "gemini/gemini-3.5-flash"
+    llm_model: str = "gemini/gemini-3.5-flash-lite"
     llm_temperature: float = 0.0
+    log_llm_inputs: bool = False
 
     # --- S3.4 worker settings ---
     # The application scope prefix for the AI fields on the incident table

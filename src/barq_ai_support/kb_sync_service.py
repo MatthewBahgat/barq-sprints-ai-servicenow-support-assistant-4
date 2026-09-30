@@ -8,12 +8,14 @@ Also runnable standalone for a single article:
 """
 import asyncio
 import hashlib
+import json
 import sys
 
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import Filter, FieldCondition, MatchValue, PointIdsList
 
 from .ingestion.chunker import chunk_article
 from .ingestion import qdrant_store  # reuse client, COLLECTION_NAME, generate_point_id, upsert_chunks
+from .ingestion.embedding import get_embedding_provider
 from .servicenow_client import ServiceNowClient
 from . import kb_state_store as state_store
 
@@ -48,6 +50,83 @@ def _delete_points_for_article(sys_id: str) -> None:
     )
 
 
+def _delete_stale_points_for_article(sys_id: str, chunks: list[dict]) -> None:
+    """Remove old chunk IDs only after replacement chunks were upserted."""
+    current_ids = {
+        qdrant_store.generate_point_id(chunk)
+        for chunk in chunks
+    }
+    stale_ids = []
+    offset = None
+
+    while True:
+        points, offset = qdrant_store.client.scroll(
+            collection_name=qdrant_store.COLLECTION_NAME,
+            scroll_filter=_article_filter(sys_id),
+            limit=100,
+            offset=offset,
+            with_payload=["sys_id"],
+        )
+        stale_ids.extend(point.id for point in points if str(point.id) not in current_ids)
+        if offset is None:
+            break
+
+    if stale_ids:
+        qdrant_store.client.delete(
+            collection_name=qdrant_store.COLLECTION_NAME,
+            points_selector=PointIdsList(points=stale_ids),
+        )
+
+
+def _article_points_are_current(sys_id: str) -> bool:
+    """Return whether all stored chunks have text and use the active embedder."""
+    offset = None
+    found_points = False
+
+    while True:
+        points, offset = qdrant_store.client.scroll(
+            collection_name=qdrant_store.COLLECTION_NAME,
+            scroll_filter=_article_filter(sys_id),
+            limit=100,
+            offset=offset,
+            with_payload=["text", "embedding_provider"],
+        )
+        if not points:
+            return found_points
+
+        found_points = True
+        if any(
+            not point.payload
+            or not point.payload.get("text")
+            or point.payload.get("embedding_provider") != get_embedding_provider()
+            for point in points
+        ):
+            return False
+        if offset is None:
+            return True
+
+
+def _indexed_article_sys_ids() -> list[str]:
+    """Collect distinct ServiceNow article IDs from every Qdrant page."""
+    sys_ids: set[str] = set()
+    offset = None
+
+    while True:
+        points, offset = qdrant_store.client.scroll(
+            collection_name=qdrant_store.COLLECTION_NAME,
+            limit=100,
+            offset=offset,
+            with_payload=["sys_id"],
+        )
+        sys_ids.update(
+            point.payload["sys_id"]
+            for point in points
+            if point.payload and point.payload.get("sys_id")
+        )
+        if offset is None:
+            return sorted(sys_ids)
+
+
 def _patch_metadata_only(sys_id: str, metadata: dict) -> None:
     """Path 3: update payload fields on existing points, no embedding calls."""
     patch_fields = {
@@ -79,13 +158,21 @@ def sync_article(sys_id: str, operation: str) -> dict:
     new_hash = _hash_body(body)
     existing = state_store.get_article_state(sys_id)
 
-    if existing is None or existing.body_hash != new_hash:
-        # Path 2: new article or body changed -> delete old points, re-chunk, re-embed, upsert
-        _delete_points_for_article(sys_id)
+    body_changed = existing is None or existing.body_hash != new_hash
+    chunks_are_current = True if body_changed else _article_points_are_current(sys_id)
+
+    if body_changed or not chunks_are_current:
         chunks = chunk_article(article, chunk_size=1000, overlap=100)
-        qdrant_store.upsert_chunks(chunks)
+        if not qdrant_store.upsert_chunks(chunks):
+            return {
+                "sys_id": sys_id,
+                "status": "error",
+                "error": "Embedding failed; retry the article sync.",
+            }
+        _delete_stale_points_for_article(sys_id, chunks)
         state_store.upsert_article_state(sys_id, new_hash, article)
-        return {"sys_id": sys_id, "action": "re_embedded", "chunk_count": len(chunks)}
+        action = "re_embedded" if body_changed else "re_embedded_stale_embeddings"
+        return {"sys_id": sys_id, "action": action, "chunk_count": len(chunks)}
 
     # Body unchanged — check if metadata actually differs
     metadata_changed = (
@@ -104,9 +191,51 @@ def sync_article(sys_id: str, operation: str) -> dict:
     return {"sys_id": sys_id, "action": "skipped_unchanged"}
 
 
+def reindex_all_indexed_articles() -> dict:
+    """Re-sync every distinct article currently represented in Qdrant."""
+    qdrant_store.create_collection()
+    _ensure_sys_id_index()
+    sys_ids = _indexed_article_sys_ids()
+    failures = []
+    reembedded = 0
+    skipped = 0
+
+    for index, sys_id in enumerate(sys_ids, start=1):
+        print(f"Reindexing article {index}/{len(sys_ids)}: {sys_id}")
+        try:
+            result = sync_article(sys_id, "update")
+        except Exception as error:
+            failures.append({"sys_id": sys_id, "error": str(error)})
+            print(f"Failed article {sys_id}: {error}")
+            continue
+
+        if result.get("status") == "error":
+            failures.append({"sys_id": sys_id, "error": result["error"]})
+        elif result.get("action", "").startswith("re_embedded"):
+            reembedded += 1
+        else:
+            skipped += 1
+
+    return {
+        "total": len(sys_ids),
+        "reembedded": reembedded,
+        "skipped": skipped,
+        "failed": len(failures),
+        "failures": failures,
+    }
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--reindex-all":
+        summary = reindex_all_indexed_articles()
+        print(json.dumps(summary, indent=2))
+        sys.exit(1 if summary["failed"] else 0)
+
     if len(sys.argv) != 3 or sys.argv[2] not in ("insert", "update", "delete"):
-        print("Usage: uv run python -m src.barq_ai_support.kb_sync_service <sys_id> <insert|update|delete>")
+        print(
+            "Usage: uv run python -m src.barq_ai_support.kb_sync_service "
+            "<sys_id> <insert|update|delete> | --reindex-all"
+        )
         sys.exit(1)
 
     result = sync_article(sys.argv[1], sys.argv[2])

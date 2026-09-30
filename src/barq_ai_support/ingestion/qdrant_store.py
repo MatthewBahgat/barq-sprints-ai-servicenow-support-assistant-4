@@ -7,7 +7,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from barq_ai_support.ingestion.chunker import chunk_articles
-from barq_ai_support.ingestion.embedding import create_embedding
+from barq_ai_support.ingestion.embedding import create_embedding, get_embedding_provider
 from barq_ai_support.servicenow_client import ServiceNowClient
 
 
@@ -76,7 +76,7 @@ def generate_point_id(chunk: dict) -> str:
 def upsert_chunks(
     chunks: list[dict],
     batch_size: int = BATCH_SIZE,
-) -> None:
+) -> bool:
     """
     Generate embeddings for chunks and store them in Qdrant
     in batches.
@@ -132,7 +132,7 @@ def upsert_chunks(
                 "the failed chunks."
             )
 
-            return
+            return False
 
         # Generate deterministic point ID
         point_id = generate_point_id(
@@ -143,7 +143,11 @@ def upsert_chunks(
         point = PointStruct(
             id=point_id,
             vector=vector,
-            payload=chunk["metadata"],
+            payload={
+                **chunk["metadata"],
+                "text": chunk["text"],
+                "embedding_provider": get_embedding_provider(),
+            },
         )
 
         points.append(point)
@@ -188,6 +192,7 @@ def upsert_chunks(
         f"Finished. Total upserted: "
         f"{total_upserted} chunks."
     )
+    return True
 
 
 def ingest_articles(

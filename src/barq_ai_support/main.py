@@ -7,6 +7,10 @@ from .webhook import router as webhook_router
 
 from .kb_webhook import router as kb_webhook_router
 
+from .servicenow_client import ServiceNowClient
+
+_sn_client = ServiceNowClient()
+
 
 app = FastAPI(
     title="BARQ AI ServiceNow Support Assistant",

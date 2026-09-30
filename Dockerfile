@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml uv.lock* README.md ./
 COPY src ./src
 COPY benchmark ./benchmark
-RUN uv sync --no-dev
+RUN uv sync --no-dev --no-editable
 
 # Run as non-root (Celery refuses to run cleanly as root/superuser).
 RUN useradd --create-home appuser && chown -R appuser:appuser /app

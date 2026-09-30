@@ -16,6 +16,8 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from barq_ai_support.agent.s3_worker import (
+    _build_incident_block,
+    _select_embedding_fn,
     RunState,
     TERMINAL_TOOL_NAMES,
     build_tools,
@@ -49,12 +51,14 @@ class ScriptedLLM:
     def __init__(self, responses: list[AIMessage]):
         self._responses = list(responses)
         self.call_count = 0
+        self.seen_messages = []
 
     def bind_tools(self, tools, **kwargs):
         return self
 
     async def ainvoke(self, messages):
         self.call_count += 1
+        self.seen_messages.append(list(messages))
         if not self._responses:
             return AIMessage(content="(no more scripted responses)")
         return self._responses.pop(0)
@@ -106,6 +110,94 @@ def test_no_resolve_close_reassign_tool():
 
 def test_terminal_tool_names_match_registry():
     assert TERMINAL_TOOL_NAMES == {"suggestAnswer", "requestHR"}
+
+
+def test_litellm_query_embeddings_use_the_ingestion_provider(monkeypatch):
+    from barq_ai_support.ingestion.embedding import create_embedding
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("LITELLM_BASE_URL", "https://proxy.example")
+    monkeypatch.setenv("LITELLM_API_KEY", "test-key")
+
+    assert _select_embedding_fn() is create_embedding
+
+
+def test_incident_block_masks_credentials_and_personal_data():
+    incident = {
+        **INCIDENT,
+        "short_description": (
+            'Login failed; password=hunter2; passphrase="my long secret phrase"'
+        ),
+        "description": "Contact jane.doe@example.com, SSN 123-45-6789",
+    }
+
+    block = _build_incident_block(incident)
+
+    assert "hunter2" not in block
+    assert "my long secret phrase" not in block
+    assert "jane.doe@example.com" not in block
+    assert "123-45-6789" not in block
+    assert "[REDACTED]" in block
+    assert "[REDACTED_EMAIL]" in block
+    assert "[REDACTED_SSN]" in block
+
+
+@pytest.mark.asyncio
+async def test_retrieved_tool_output_is_masked_before_next_model_call():
+    sn_client = _mock_sn_client()
+    llm = ScriptedLLM([
+        make_tool_call("searchKB", {"query": "VPN login"}, "call_1"),
+        make_tool_call("requestHR", {"reason": "No safe resolution found."}, "call_2"),
+    ])
+    result_with_sensitive_text = _fake_retrieval_result(
+        chunks=[
+            RetrievedChunk(
+                chunk_id="1",
+                score=0.91,
+                text=(
+                    "Use password=hunter2; contact jane.doe@example.com "
+                    "or call 555-123-4567."
+                ),
+                article_number="KB0001",
+                category="Network",
+            )
+        ]
+    )
+
+    with patch(
+        "barq_ai_support.agent.s3_worker.retrieve",
+        return_value=result_with_sensitive_text,
+    ):
+        await run_agent_loop(INCIDENT, sn_client, llm=llm)
+
+    tool_message = llm.seen_messages[1][-1]
+    assert "hunter2" not in tool_message.content
+    assert "jane.doe@example.com" not in tool_message.content
+    assert "555-123-4567" not in tool_message.content
+
+
+@pytest.mark.asyncio
+async def test_optional_llm_input_log_contains_masked_incident(caplog, monkeypatch):
+    import logging
+
+    monkeypatch.setattr(settings, "log_llm_inputs", True)
+    caplog.set_level(logging.WARNING, logger="barq_ai_support.agent.s3_worker")
+    incident = {
+        **INCIDENT,
+        "description": "QA password=FAKE_PASSWORD_123 contact=qa-mask@example.invalid",
+    }
+    sn_client = _mock_sn_client()
+    llm = ScriptedLLM([
+        make_tool_call("requestHR", {"reason": "QA complete."}, "call_1"),
+    ])
+
+    await run_agent_loop(incident, sn_client, llm=llm)
+
+    assert "Masked LLM input" in caplog.text
+    assert "FAKE_PASSWORD_123" not in caplog.text
+    assert "qa-mask@example.invalid" not in caplog.text
+    assert "[REDACTED]" in caplog.text
+    assert "[REDACTED_EMAIL]" in caplog.text
 
 
 # ---------------------------------------------------------------------------
