@@ -125,7 +125,7 @@ def test_incident_block_masks_credentials_and_personal_data():
     incident = {
         **INCIDENT,
         "short_description": (
-            'Login failed; password=hunter2; passphrase="my long secret phrase"'
+            'Login failed; token=hunter2; client_secret="my long secret phrase"'
         ),
         "description": "Contact jane.doe@example.com, SSN 123-45-6789",
     }
@@ -154,7 +154,7 @@ async def test_retrieved_tool_output_is_masked_in_tool_message():
                 chunk_id="1",
                 score=0.91,
                 text=(
-                    "Use password=hunter2; contact jane.doe@example.com "
+                    "Use api_key=hunter2; contact jane.doe@example.com "
                     "or call 555-123-4567."
                 ),
                 article_number="KB0001",
@@ -300,8 +300,74 @@ async def test_step_budget_exhausted_triggers_failsafe_escalation():
 
     assert result["tool"] == "requestHR"
     assert result["status"] == "escalated"
-    assert "step budget" in result["reason"].lower() or "Fail-safe" in result["reason"]
+    assert result["reason"] == "No knowledge article found for this incident."
     assert llm.call_count == 3  # respected the max_steps bound
+
+
+@pytest.mark.asyncio
+async def test_searchkb_result_does_not_end_the_run():
+    """A good searchKB hit is handed back to the agent; it must still decide."""
+    sn_client = _mock_sn_client()
+    llm = ScriptedLLM([
+        make_tool_call("searchKB", {"query": "VPN"}, "call_1"),
+        make_tool_call("searchKB", {"query": "VPN resolution steps"}, "call_2"),
+        make_tool_call(
+            "suggestAnswer",
+            {"procedure": "1. Reconnect.", "sources": "KB0001", "confidence": 0.91},
+            "call_3",
+        ),
+    ])
+
+    with patch(
+        "barq_ai_support.agent.s3_worker.retrieve",
+        return_value=_fake_retrieval_result(),
+    ):
+        result = await run_agent_loop(INCIDENT, sn_client, llm=llm)
+
+    assert llm.call_count == 3
+    assert result["tool"] == "suggestAnswer"
+    assert result["procedure"] == "1. Reconnect."
+
+
+@pytest.mark.asyncio
+async def test_searchkb_only_returns_chunks_above_threshold():
+    run = RunState(incident_sys_id="abc123")
+    tools = {t.name: t for t in build_tools(run, _mock_sn_client())}
+    chunks = [
+        RetrievedChunk(chunk_id="1", score=0.60, text="weak", article_number="KB0002", category="x"),
+        RetrievedChunk(chunk_id="2", score=0.80, text="strong", article_number="KB0001", category="x"),
+        RetrievedChunk(chunk_id="3", score=0.70, text="ok", article_number="KB0003", category="x"),
+    ]
+
+    with patch(
+        "barq_ai_support.agent.s3_worker.retrieve",
+        return_value=_fake_retrieval_result(chunks=chunks),
+    ):
+        output = await tools["searchKB"].ainvoke({"query": "VPN"})
+
+    assert [c["article_number"] for c in output] == ["KB0001", "KB0003"]
+    assert run.max_retrieval_score == 0.80
+
+
+@pytest.mark.asyncio
+async def test_escalates_after_three_searches_without_suggest_answer():
+    sn_client = _mock_sn_client()
+    llm = ScriptedLLM([
+        make_tool_call("searchKB", {"query": f"attempt {i}"}, f"call_{i}")
+        for i in range(1, 6)
+    ])
+
+    with patch(
+        "barq_ai_support.agent.s3_worker.retrieve",
+        return_value=_fake_retrieval_result(ok=False, chunks=[]),
+    ) as mock_retrieve:
+        result = await run_agent_loop(INCIDENT, sn_client, llm=llm, max_steps=10)
+
+    assert mock_retrieve.call_count == 3
+    assert result["tool"] == "requestHR"
+    assert result["reason"] == "No knowledge article found for this incident."
+    note_text = sn_client.add_work_note.await_args.args[1]
+    assert "No knowledge article found for this incident." in note_text
 
 
 # ---------------------------------------------------------------------------

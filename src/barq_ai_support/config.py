@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     ai_field_prefix: str = "x_2066139_ai_triag_"
     # Max ReAct loop iterations before the fail-safe escalation fires.
     agent_max_steps: int = 6
+    # searchKB only shows the agent chunks scoring above this.
+    agent_chunk_threshold: float = 0.65
+    # searchKB calls allowed before the run escalates to a human.
+    agent_max_searches: int = 3
 
     # --- S3.3: HMAC signing secrets ---
     # Authoritative auth mechanism for both event receivers below -- there

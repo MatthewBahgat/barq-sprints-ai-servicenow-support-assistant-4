@@ -1,4 +1,9 @@
-"""Pattern-based redaction for common secrets and personal data."""
+"""Pattern-based redaction for common secrets and personal data.
+
+Passwords are not handled here: they are masked by the ServiceNow "before"
+Business Rule (businessRule/mask_password_before.js) before the incident is
+saved.
+"""
 
 import re
 
@@ -6,7 +11,7 @@ import re
 _SENSITIVE_PATTERNS = (
     (
         re.compile(
-            r"(?i)\b(password|passwd|pwd|passphrase|passcode|pin|secret|token|"
+            r"(?i)\b(secret|token|"
             r"authorization|cookie|api[_ -]?key|access[_ -]?token|"
             r"refresh[_ -]?token|client[_ -]?secret)\b"
             r"(\s*[:=]\s*)(?:\"([^\"]*)\"|'([^']*)'|"
