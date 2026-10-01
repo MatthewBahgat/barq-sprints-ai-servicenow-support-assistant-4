@@ -307,15 +307,10 @@ def build_tools(
         ) as span:
             result = retrieve(
                 query,
-                score_threshold=0.0,
+                score_threshold=threshold,
                 embedding_fn=_select_embedding_fn(),
             )
-
-            chunks = sorted(
-                (chunk for chunk in result.chunks if chunk.score > threshold),
-                key=lambda chunk: chunk.score,
-                reverse=True,
-            )
+            chunks = result.chunks
 
             if chunks:
                 top = chunks[0].score

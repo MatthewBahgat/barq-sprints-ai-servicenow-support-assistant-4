@@ -120,9 +120,9 @@ def retrieve(
     """
     Semantic search against the Qdrant collection.
 
-    Returns the top-k most similar chunks to `query`, each with its score
-    and article provenance. If the best score doesn't meet the threshold,
-    returns a refusal instead (see threshold gating, added next).
+    Returns the top-k most similar chunks to `query` that score above
+    `score_threshold`, best first, each with its score and article
+    provenance. If no chunk is above the threshold, returns a refusal.
     """
     if top_k is None:
         top_k = settings.retrieval_top_k
@@ -165,10 +165,16 @@ def retrieve(
         for hit in hits
     ]
 
-    best_chunk = max(chunks, key=lambda chunk: chunk.score, default=None)
-    best_score = best_chunk.score if best_chunk is not None else None
+    best_score = max((chunk.score for chunk in chunks), default=None)
 
-    if best_score is None or best_score <= score_threshold:
+    # Keep only chunks above the threshold, best first.
+    chunks = sorted(
+        (chunk for chunk in chunks if chunk.score > score_threshold),
+        key=lambda chunk: chunk.score,
+        reverse=True,
+    )
+
+    if not chunks:
         refusal_message = (
             f"No relevant knowledge articles found for query: {query!r}. "
             f"Best score achieved: {best_score}, "

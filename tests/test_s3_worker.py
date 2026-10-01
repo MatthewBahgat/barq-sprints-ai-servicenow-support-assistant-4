@@ -330,11 +330,10 @@ async def test_searchkb_result_does_not_end_the_run():
 
 
 @pytest.mark.asyncio
-async def test_searchkb_only_returns_chunks_above_threshold():
+async def test_searchkb_uses_agent_threshold_and_returns_retrieved_chunks():
     run = RunState(incident_sys_id="abc123")
     tools = {t.name: t for t in build_tools(run, _mock_sn_client())}
     chunks = [
-        RetrievedChunk(chunk_id="1", score=0.60, text="weak", article_number="KB0002", category="x"),
         RetrievedChunk(chunk_id="2", score=0.80, text="strong", article_number="KB0001", category="x"),
         RetrievedChunk(chunk_id="3", score=0.70, text="ok", article_number="KB0003", category="x"),
     ]
@@ -342,9 +341,10 @@ async def test_searchkb_only_returns_chunks_above_threshold():
     with patch(
         "barq_ai_support.agent.s3_worker.retrieve",
         return_value=_fake_retrieval_result(chunks=chunks),
-    ):
+    ) as mock_retrieve:
         output = await tools["searchKB"].ainvoke({"query": "VPN"})
 
+    assert mock_retrieve.call_args.kwargs["score_threshold"] == settings.agent_chunk_threshold
     assert [c["article_number"] for c in output] == ["KB0001", "KB0003"]
     assert run.max_retrieval_score == 0.80
 
