@@ -103,7 +103,7 @@ def gemini_embedding_fn(text: str) -> list[float]:
         _gemini_client = genai.Client(api_key=api_key)
 
     response = _gemini_client.models.embed_content(
-        model="gemini-embedding-001",
+        model="gemini-embedding-2",
         contents=text,
         config={"output_dimensionality": 768},
     )
